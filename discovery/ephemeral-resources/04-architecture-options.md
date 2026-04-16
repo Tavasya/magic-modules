@@ -6,6 +6,315 @@ This document explores different architectural approaches for generating both da
 
 ---
 
+## Current State: How It Works Today
+
+Before diving into the proposed unified approach, it's important to understand how data sources and ephemeral resources are currently implemented separately.
+
+### Current Data Source Flow (Generated)
+
+Data sources CAN be generated from YAML definitions using the `datasource_experimental` flag. When enabled, mmv1 generates a simple wrapper around the resource's Read function.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    CURRENT DATA SOURCE GENERATION FLOW                       │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  YAML Definition (e.g., mmv1/products/cloudrun/Service.yaml)                │
+│                                                                             │
+│  datasource_experimental:                                                   │
+│    generate: true                                                           │
+│    exclude_test: true                                                       │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                       │
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  mmv1/provider/terraform.go                                                 │
+│                                                                             │
+│  GenerateObject() {                                                         │
+│      ...                                                                    │
+│      t.GenerateSingularDataSource(object, templateData, outputFolder)       │
+│      ...                                                                    │
+│  }                                                                          │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                       │
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  Template: mmv1/templates/terraform/datasource.go.tmpl                      │
+│                                                                             │
+│  Key Logic:                                                                 │
+│  1. Reuse resource schema: rs := Resource{{ .ResourceName }}().Schema       │
+│  2. Convert to datasource: DatasourceSchemaFromResourceSchema(rs)           │
+│  3. Add required fields from IdFormat                                       │
+│  4. Delegate read to resource: resource{{ $.ResourceName }}Read(d, meta)    │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                       │
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  Generated Output: google/services/cloudrun/data_source_cloud_run_service.go│
+│                                                                             │
+│  func DataSourceCloudRunService() *schema.Resource {                        │
+│      rs := ResourceCloudRunService().Schema  // Reuse resource schema       │
+│      dsSchema := tpgresource.DatasourceSchemaFromResourceSchema(rs)         │
+│      return &schema.Resource{                                               │
+│          Read:   dataSourceCloudRunServiceRead,                             │
+│          Schema: dsSchema,                                                  │
+│      }                                                                      │
+│  }                                                                          │
+│                                                                             │
+│  func dataSourceCloudRunServiceRead(d, meta) error {                        │
+│      d.SetId(id)                                                            │
+│      return resourceCloudRunServiceRead(d, meta)  // Delegate to resource   │
+│  }                                                                          │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                       │
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  Registration: Via registry system (SDK v2)                                 │
+│                                                                             │
+│  func init() {                                                              │
+│      registry.Schema{                                                       │
+│          Name:        "google_cloud_run_service",                           │
+│          Type:        registry.SchemaTypeDataSource,                        │
+│          Schema:      DataSourceCloudRunService(),                          │
+│      }.Register()                                                           │
+│  }                                                                          │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Key Characteristics of Current Data Source Generation:**
+- Uses **SDK v2** (`terraform-plugin-sdk/v2/helper/schema`)
+- **Delegates to resource Read** function (no separate API logic)
+- **Registered via registry** system
+- **State is persisted** in Terraform state file
+- Simple wrapper pattern - minimal code generation
+
+---
+
+### Current Ephemeral Resource Flow (Handwritten)
+
+Ephemeral resources are **NOT generated** - they are entirely handwritten in `mmv1/third_party/terraform/services/`. Each one is manually coded using the Plugin Framework.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                 CURRENT EPHEMERAL RESOURCE FLOW (HANDWRITTEN)                │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  NO YAML DEFINITION - Entirely handwritten                                  │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                       │
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  Handwritten File:                                                          │
+│  mmv1/third_party/terraform/services/secretmanager/                         │
+│      ephemeral_google_secret_manager_secret_version.go                      │
+│                                                                             │
+│  Developer manually writes:                                                 │
+│  1. Struct definition                                                       │
+│  2. Model with tfsdk tags                                                   │
+│  3. Metadata() method                                                       │
+│  4. Schema() method                                                         │
+│  5. Configure() method                                                      │
+│  6. Open() method with full API logic                                       │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                       │
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  Handwritten Code Structure:                                                │
+│                                                                             │
+│  // Must implement ephemeral.EphemeralResource interface                    │
+│  var _ ephemeral.EphemeralResource = &googleEphemeralSecretManagerSV{}      │
+│                                                                             │
+│  type googleEphemeralSecretManagerSecretVersion struct {                    │
+│      providerConfig *transport_tpg.Config                                   │
+│  }                                                                          │
+│                                                                             │
+│  // Model with Plugin Framework types                                       │
+│  type ephemeralSecretManagerSecretVersionModel struct {                     │
+│      Project    types.String `tfsdk:"project"`                              │
+│      Secret     types.String `tfsdk:"secret"`                               │
+│      SecretData types.String `tfsdk:"secret_data"`  // Sensitive            │
+│      ...                                                                    │
+│  }                                                                          │
+│                                                                             │
+│  func (p *googleEphemeral...) Schema(...) {                                 │
+│      // Manually define entire schema                                       │
+│      resp.Schema = schema.Schema{                                           │
+│          Attributes: map[string]schema.Attribute{                           │
+│              "secret_data": schema.StringAttribute{                         │
+│                  Computed:  true,                                           │
+│                  Sensitive: true,  // Must manually mark                    │
+│              },                                                             │
+│          },                                                                 │
+│      }                                                                      │
+│  }                                                                          │
+│                                                                             │
+│  func (p *googleEphemeral...) Open(...) {                                   │
+│      // Manually write ALL API call logic                                   │
+│      // - Build URL                                                         │
+│      // - Make HTTP request                                                 │
+│      // - Parse response                                                    │
+│      // - Set result                                                        │
+│  }                                                                          │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                       │
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  Registration: Manually added to framework_provider.go.tmpl                 │
+│                                                                             │
+│  func (p *FrameworkProvider) EphemeralResources(_ context.Context)          │
+│      []func() ephemeral.EphemeralResource {                                 │
+│      return []func() ephemeral.EphemeralResource{                           │
+│          // Each one manually listed                                        │
+│          resourcemanager.GoogleEphemeralClientConfig,                       │
+│          resourcemanager.GoogleEphemeralServiceAccountAccessToken,          │
+│          secretmanager.GoogleEphemeralSecretManagerSecretVersion,           │
+│          ...                                                                │
+│      }                                                                      │
+│  }                                                                          │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Key Characteristics of Current Ephemeral Resources:**
+- Uses **Plugin Framework** (`terraform-plugin-framework/ephemeral`)
+- **Entirely handwritten** - no code generation
+- **Duplicates API logic** that may exist in data source
+- **Registered manually** in framework_provider.go.tmpl
+- **State is NOT persisted** - data never written to state file
+- **Sensitive fields manually marked** in schema
+
+---
+
+### Side-by-Side Comparison: Data Source vs Ephemeral (Current)
+
+```
+┌────────────────────────────────────┬────────────────────────────────────┐
+│         DATA SOURCE (Current)       │      EPHEMERAL RESOURCE (Current)  │
+├────────────────────────────────────┼────────────────────────────────────┤
+│                                    │                                    │
+│  ┌──────────────────────────────┐  │  ┌──────────────────────────────┐  │
+│  │     YAML Definition          │  │  │     NO YAML Definition       │  │
+│  │  datasource_experimental:    │  │  │     (Handwritten only)       │  │
+│  │    generate: true            │  │  │                              │  │
+│  └──────────────────────────────┘  │  └──────────────────────────────┘  │
+│               │                    │               │                    │
+│               ▼                    │               ▼                    │
+│  ┌──────────────────────────────┐  │  ┌──────────────────────────────┐  │
+│  │   mmv1 Generator             │  │  │   Manual Coding              │  │
+│  │   (datasource.go.tmpl)       │  │  │   (in third_party/)          │  │
+│  └──────────────────────────────┘  │  └──────────────────────────────┘  │
+│               │                    │               │                    │
+│               ▼                    │               ▼                    │
+│  ┌──────────────────────────────┐  │  ┌──────────────────────────────┐  │
+│  │   SDK v2                     │  │  │   Plugin Framework           │  │
+│  │   (terraform-plugin-sdk)     │  │  │   (terraform-plugin-framework)│  │
+│  └──────────────────────────────┘  │  └──────────────────────────────┘  │
+│               │                    │               │                    │
+│               ▼                    │               ▼                    │
+│  ┌──────────────────────────────┐  │  ┌──────────────────────────────┐  │
+│  │   Delegates to Resource      │  │  │   Standalone API Logic       │  │
+│  │   resourceXxxRead(d, meta)   │  │  │   (duplicated code)          │  │
+│  └──────────────────────────────┘  │  └──────────────────────────────┘  │
+│               │                    │               │                    │
+│               ▼                    │               ▼                    │
+│  ┌──────────────────────────────┐  │  ┌──────────────────────────────┐  │
+│  │   Registry Registration      │  │  │   Manual Registration        │  │
+│  │   registry.Schema{}.Register │  │  │   EphemeralResources() list  │  │
+│  └──────────────────────────────┘  │  └──────────────────────────────┘  │
+│               │                    │               │                    │
+│               ▼                    │               ▼                    │
+│  ┌──────────────────────────────┐  │  ┌──────────────────────────────┐  │
+│  │   STATE FILE                 │  │  │   NO STATE                   │  │
+│  │   (data persisted)           │  │  │   (never persisted)          │  │
+│  └──────────────────────────────┘  │  └──────────────────────────────┘  │
+│                                    │                                    │
+└────────────────────────────────────┴────────────────────────────────────┘
+```
+
+---
+
+### The Problem: Code Duplication
+
+When both a data source and ephemeral resource exist for the same API (e.g., Secret Manager Secret Version), there's significant code duplication:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                            CODE DUPLICATION EXAMPLE                          │
+│                     (Secret Manager Secret Version)                          │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────┐  ┌─────────────────────────────────────┐
+│  data_source_secret_manager_        │  │  ephemeral_google_secret_manager_   │
+│  secret_version.go (Handwritten)    │  │  secret_version.go (Handwritten)    │
+├─────────────────────────────────────┤  ├─────────────────────────────────────┤
+│                                     │  │                                     │
+│  // Schema definition               │  │  // Schema definition               │
+│  "project": {                       │  │  "project": schema.StringAttribute{ │
+│      Type: schema.TypeString,       │  │      Optional: true,                │
+│      Optional: true,                │  │      Computed: true,                │
+│  },                                 │  │  },                                 │
+│  "secret": {                        │  │  "secret": schema.StringAttribute{  │
+│      Type: schema.TypeString,       │  │      Required: true,                │
+│      Required: true,                │  │  },                                 │
+│  },                                 │  │  "secret_data": schema.StringAttr{  │
+│  "secret_data": {                   │  │      Computed: true,                │
+│      Type: schema.TypeString,       │  │      Sensitive: true,               │
+│      Computed: true,                │  │  },                                 │
+│      Sensitive: true,               │  │                                     │
+│  },                                 │  │  // DUPLICATED API LOGIC            │
+│                                     │  │  url := fmt.Sprintf("%sprojects/    │
+│  // API Logic                       │  │      %s/secrets/%s/versions/%s",    │
+│  url := fmt.Sprintf("%sprojects/    │  │      config.SecretManagerBasePath,  │
+│      %s/secrets/%s/versions/%s",    │  │      project, secret, version)      │
+│      config.SecretManagerBasePath,  │  │                                     │
+│      project, secret, version)      │  │  versionResp, err := transport_tpg. │
+│                                     │  │      SendRequest(...)               │
+│  versionResp, err := transport_tpg. │  │                                     │
+│      SendRequest(...)               │  │  // DUPLICATED base64 decode        │
+│                                     │  │  decoded, err := base64.StdEncoding.│
+│  // base64 decode                   │  │      DecodeString(payload["data"])  │
+│  decoded, err := base64.StdEncoding.│  │                                     │
+│      DecodeString(payload["data"])  │  │                                     │
+│                                     │  │                                     │
+└─────────────────────────────────────┘  └─────────────────────────────────────┘
+                     │                                      │
+                     └──────────────┬───────────────────────┘
+                                    │
+                                    ▼
+                    ┌───────────────────────────────────┐
+                    │  ~70% of code is DUPLICATED:      │
+                    │  - Schema field definitions       │
+                    │  - URL construction               │
+                    │  - API calls                      │
+                    │  - Response parsing               │
+                    │  - Base64 decoding                │
+                    │  - Error handling                 │
+                    │                                   │
+                    │  ~30% is different:               │
+                    │  - Framework types                │
+                    │  - Registration mechanism         │
+                    │  - State handling                 │
+                    └───────────────────────────────────┘
+```
+
+---
+
+### Why We Need a Unified Generator
+
+| Problem | Impact |
+|---------|--------|
+| **Code duplication** | Same API logic written twice, bugs must be fixed twice |
+| **Inconsistency risk** | Data source and ephemeral may behave differently |
+| **Maintenance burden** | Changes require updating multiple files |
+| **No YAML definition** | Ephemeral resources can't leverage existing resource definitions |
+| **Manual registration** | Easy to forget to register new ephemeral resources |
+| **Different frameworks** | SDK v2 vs Plugin Framework require different code |
+
+**The Goal:** Generate BOTH from a single YAML definition, with shared core logic.
+
+---
+
 ## Option A: Wrapper Pattern (Recommended)
 
 ### Concept
