@@ -113,4 +113,5 @@ Located in `mmv1/third_party/terraform/services/`:
 - `06-implementation-plan.md` - Implementation approach (needs update)
 - `07-key-code-references.md` - Quick reference for key files
 - `08-standalone-ephemeral-generation.md` - Standalone generation approach (fallback)
-- `09-go-reflect-approach.md` - **NEW: Go reflect bridge investigation**
+- `09-go-reflect-approach.md` - Go reflect bridge investigation (technical)
+- `10-reflect-for-beginners.md` - **NEW: Beginner-friendly reflect explanation**
