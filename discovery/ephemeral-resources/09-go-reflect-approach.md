@@ -358,7 +358,33 @@ func ExtractAllValues(d *schema.ResourceData, sdkSchema map[string]*schema.Schem
 
 ## Existing Reflect Usage in Codebase
 
-The provider already uses reflect for type conversion in `mmv1/third_party/terraform/tpgresource/convert.go`:
+### Example 1: Dynamic Field Access (`fwtransport/framework_utils.go:360`)
+
+**This is the most relevant example** - it shows dynamic field access by name:
+
+```go
+// In BuildReplacementFunc - replaces {{FieldName}} with config values
+// 'm' is a string variable containing the field name
+
+if f := reflect.Indirect(reflect.ValueOf(config)).FieldByName(m); f.IsValid() {
+    return f.String()
+}
+```
+
+This dynamically accesses a field on `*transport_tpg.Config` using a string variable. Without reflect, you'd need a switch statement for every possible field name.
+
+**How we'd use this pattern:**
+```go
+// Dynamically get Plugin Framework model field value
+fieldName := "Project"  // from tfsdk tag
+field := reflect.Indirect(reflect.ValueOf(&model)).FieldByName(fieldName)
+method := field.MethodByName("ValueString")
+value := method.Call(nil)[0].String()  // "my-project"
+```
+
+### Example 2: Type Conversion (`tpgresource/convert.go`)
+
+Used for converting between API response types:
 
 ```go
 func Convert(item, out interface{}) error {
@@ -382,7 +408,7 @@ func setOmittedFields(item, out interface{}) {
     oVal := reflect.ValueOf(out).Elem()
 
     for i := 0; i < iVal.NumField(); i++ {
-        // ... uses reflect to copy fields
+        // ... uses reflect to copy fields between structs
     }
 }
 ```

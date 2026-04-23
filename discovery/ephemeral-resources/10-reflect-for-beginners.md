@@ -1,5 +1,7 @@
 # Go Reflect for Beginners: How It Applies to Our Problem
 
+> **Note**: Reflect is already used in this codebase! See `fwtransport/framework_utils.go:360` for a real example.
+
 ## The Problem We're Trying to Solve
 
 We have two different "worlds" in the Terraform provider:
@@ -107,6 +109,74 @@ func setFieldByName(obj interface{}, fieldName string, newValue interface{}) {
 p := Person{Name: "Alice", Age: 30}
 setFieldByName(&p, "Name", "Bob")
 fmt.Println(p.Name)  // "Bob"
+```
+
+---
+
+## Real Example in This Codebase
+
+Reflect is **already used** in this provider! Look at `fwtransport/framework_utils.go:360`:
+
+```go
+// Attempt to draw values from the provider config if it's present.
+if f := reflect.Indirect(reflect.ValueOf(config)).FieldByName(m); f.IsValid() {
+    return f.String()
+}
+```
+
+### What This Code Does
+
+```go
+// 'm' is a string variable containing a field name, e.g., "SecretManagerBasePath"
+
+reflect.ValueOf(config)    // Get reflection of the config pointer
+reflect.Indirect(...)      // Dereference pointer to get the actual struct
+.FieldByName(m)            // Find field by NAME (a string variable!)
+.IsValid()                 // Check if the field exists
+.String()                  // Get its string value
+```
+
+### Why It's Used
+
+The `BuildReplacementFunc` function needs to replace template variables like `{{SecretManagerBasePath}}` with actual values from the config. But the field name comes from a **string variable** (parsed from the template), not hardcoded.
+
+Without reflect:
+```go
+// Would need a giant switch statement for every possible field!
+switch m {
+case "SecretManagerBasePath":
+    return config.SecretManagerBasePath
+case "ComputeBasePath":
+    return config.ComputeBasePath
+// ... hundreds more
+}
+```
+
+With reflect:
+```go
+// Works for ANY field name dynamically
+f := reflect.Indirect(reflect.ValueOf(config)).FieldByName(m)
+return f.String()
+```
+
+### How This Applies to Us
+
+We'd use the **exact same pattern** to dynamically access Plugin Framework model fields:
+
+```go
+// Model has fields like Project, Secret, Version with tfsdk tags
+type Model struct {
+    Project types.String `tfsdk:"project"`
+    Secret  types.String `tfsdk:"secret"`
+}
+
+// Dynamically get the "Project" field's value
+fieldName := "Project"
+field := reflect.Indirect(reflect.ValueOf(&model)).FieldByName(fieldName)
+
+// Call the ValueString() method on it
+method := field.MethodByName("ValueString")
+value := method.Call(nil)[0].String()  // Returns "my-project"
 ```
 
 ---

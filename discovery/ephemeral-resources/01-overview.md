@@ -17,11 +17,23 @@ After investigation and team discussion, **direct wrapper pattern (calling data 
 
 Exploring whether Go's `reflect` package can provide a **runtime bridge** between SDK v2 and Plugin Framework. See `09-go-reflect-approach.md` for details.
 
-Key insight: SDK v2 has `Resource.Data()` method that creates `*ResourceData` at runtime, enabling:
-1. Create `*ResourceData` from data source schema
-2. Populate with input values from Plugin Framework
-3. Call SDK v2 Read function
-4. Extract values and convert back to Plugin Framework types
+**Key discoveries:**
+
+1. **`Resource.Data()` method** - SDK v2 can create `*ResourceData` at runtime (see `list_google_service_account.go:92`)
+
+2. **Reflect already used in codebase** - See `fwtransport/framework_utils.go:360`:
+   ```go
+   if f := reflect.Indirect(reflect.ValueOf(config)).FieldByName(m); f.IsValid() {
+       return f.String()
+   }
+   ```
+   This dynamically accesses struct fields by name - exactly what we need.
+
+3. **Bridge flow:**
+   - Create `*ResourceData` from data source schema
+   - Populate with input values from Plugin Framework
+   - Call SDK v2 Read function (unchanged!)
+   - Extract values and convert back to Plugin Framework types
 
 **Status**: Potentially feasible - needs prototype to validate.
 
