@@ -1,8 +1,33 @@
-# Ephemeral Resources Unified Generator - Discovery Overview
+# Ephemeral Resources Generator - Discovery Overview
 
 ## Executive Summary
 
-This discovery document explores the feasibility and approach for generating Terraform ephemeral resources alongside data sources in Magic Modules. The goal is to create a unified generator that can produce both resource types from a single definition.
+This discovery document explores the feasibility and approach for generating Terraform ephemeral resources in Magic Modules.
+
+### ⚠️ Key Finding: Direct Wrapper is Blocked
+
+After investigation and team discussion, **direct wrapper pattern (calling data source Read from ephemeral) is not currently feasible** because:
+
+1. Generated data sources delegate to `resourceXxxRead()` which is SDK v2 code
+2. Ephemeral resources must use Plugin Framework
+3. Can't directly call SDK v2 code from Plugin Framework
+4. Would require completing the full SDK v2 → Plugin Framework migration first
+
+### 🔍 New Investigation: Go Reflect Bridge (In Progress)
+
+Exploring whether Go's `reflect` package can provide a **runtime bridge** between SDK v2 and Plugin Framework. See `09-go-reflect-approach.md` for details.
+
+Key insight: SDK v2 has `Resource.Data()` method that creates `*ResourceData` at runtime, enabling:
+1. Create `*ResourceData` from data source schema
+2. Populate with input values from Plugin Framework
+3. Call SDK v2 Read function
+4. Extract values and convert back to Plugin Framework types
+
+**Status**: Potentially feasible - needs prototype to validate.
+
+### Fallback Approach: Standalone Ephemeral Generation
+
+If reflect bridge doesn't work, generate **standalone ephemeral resources** with their own API logic. See `08-standalone-ephemeral-generation.md` for details.
 
 ## Background
 
@@ -60,20 +85,32 @@ Located in `mmv1/third_party/terraform/services/`:
 2. **Different Registration**: SDK v2 uses registry system, Plugin Framework uses direct provider registration
 3. **Schema Similarity**: Ephemeral resources share ~90% of schema with corresponding data sources
 4. **Sensitive Marking**: Ephemeral resources explicitly mark sensitive attributes
+5. **BLOCKER**: Data sources delegate to resource Read (SDK v2), so can't wrap them from Plugin Framework
 
 ## Scope of This Discovery
 
 1. Understand current data source generation pipeline
 2. Understand ephemeral resource implementation patterns
-3. Identify integration points for unified generation
+3. ~~Identify integration points for unified generation~~ (BLOCKED)
 4. Propose architecture options
 5. Identify technical challenges and solutions
+
+## Conclusion
+
+| Approach | Status | Notes |
+|----------|--------|-------|
+| **Direct wrapper (call SDK v2 from PF)** | ❌ BLOCKED | Can't directly call SDK v2 from Plugin Framework |
+| **Go reflect bridge** | 🔍 INVESTIGATING | Use reflect to bridge frameworks at runtime |
+| **Standalone ephemeral generation** | ✅ VIABLE | Fallback - generate with own API logic |
 
 ## Documents in This Discovery
 
 - `01-overview.md` - This overview document
 - `02-current-data-source-generation.md` - How data sources are currently generated
 - `03-current-ephemeral-resources.md` - Analysis of existing handwritten ephemeral resources
-- `04-architecture-options.md` - Proposed approaches for unified generation
+- `04-architecture-options.md` - Proposed approaches (includes blocker explanation)
 - `05-technical-considerations.md` - Technical challenges and solutions
-- `06-implementation-plan.md` - Recommended implementation approach
+- `06-implementation-plan.md` - Implementation approach (needs update)
+- `07-key-code-references.md` - Quick reference for key files
+- `08-standalone-ephemeral-generation.md` - Standalone generation approach (fallback)
+- `09-go-reflect-approach.md` - **NEW: Go reflect bridge investigation**

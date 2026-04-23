@@ -6,6 +6,134 @@ This document explores different architectural approaches for generating both da
 
 ---
 
+## ⚠️ IMPORTANT UPDATE: Blocker Identified
+
+### Feedback from Team Discussion (with Cameron)
+
+After reviewing the wrapper pattern approach, a **fundamental blocker** was identified:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           THE BLOCKER                                        │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+  Current generated data sources work like this:
+
+  ┌─────────────────────────────────────────────┐
+  │  datasource.go.tmpl generates:              │
+  │                                             │
+  │  func dataSourceXxxRead(d, meta) error {    │
+  │      d.SetId(id)                            │
+  │      return resourceXxxRead(d, meta) ◄──────┼──── Delegates to RESOURCE
+  │  }                                          │
+  └─────────────────────────────────────────────┘
+                        │
+                        ▼
+  ┌─────────────────────────────────────────────┐
+  │  resourceXxxRead() is SDK v2 code!          │
+  │                                             │
+  │  - Uses schema.ResourceData                 │
+  │  - Returns error                            │
+  │  - All API logic lives here                 │
+  └─────────────────────────────────────────────┘
+
+  To wrap data source → ephemeral, we'd need:
+
+  ┌─────────────────────────────────────────────┐
+  │  Ephemeral (Plugin Framework)               │
+  │                                             │
+  │  func (e *ephemeral) Open() {               │
+  │      // Can't call resourceXxxRead()!       │
+  │      // It's SDK v2, we're Plugin Framework │
+  │  }                                          │
+  └─────────────────────────────────────────────┘
+
+  THE PROBLEM:
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │                                                                         │
+  │  Ephemeral Resource ─────X────▶ Data Source ──────▶ Resource Read      │
+  │  (Plugin Framework)      │      (SDK v2)            (SDK v2)            │
+  │                          │                                              │
+  │                     CAN'T CALL!                                         │
+  │                     Different frameworks!                               │
+  │                                                                         │
+  └─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Why the Wrapper Pattern Won't Work (For Now)
+
+1. **Data sources delegate to resource Read** - The generated data source doesn't have its own API logic; it calls `resourceXxxRead()`
+
+2. **Resource Read is SDK v2** - All the actual API logic (URL building, HTTP calls, response parsing) lives in the SDK v2 resource code
+
+3. **Can't call SDK v2 from Plugin Framework** - You can't easily call `resourceXxxRead(d *schema.ResourceData, meta)` from Plugin Framework code because:
+   - Different type systems (`schema.ResourceData` vs Plugin Framework model)
+   - Different error handling (`error` vs `Diagnostics`)
+   - Would need to create fake `schema.ResourceData` - fragile and hacky
+
+4. **Would need full resource migration first** - To make wrapper pattern work, we'd need to migrate the underlying resource to Plugin Framework, which is a massive undertaking
+
+### Conclusion: Wrapper Pattern is BLOCKED
+
+The wrapper/bridge approach (Option A in this doc) **cannot be implemented** until the SDK v2 → Plugin Framework migration for resources is complete.
+
+---
+
+## New Direction: Standalone Ephemeral Generation
+
+Instead of wrapping data sources, generate **standalone ephemeral resources** that have their own API logic:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    NEW APPROACH: STANDALONE EPHEMERAL                        │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+  ┌─────────────────────────────────────────────┐
+  │  YAML Definition                            │
+  │                                             │
+  │  ephemeral_experimental:                    │
+  │    generate: true                           │
+  └─────────────────────────────────────────────┘
+                        │
+                        ▼
+  ┌─────────────────────────────────────────────┐
+  │  Generate: ephemeral_xxx.go                 │
+  │                                             │
+  │  - Full Plugin Framework code               │
+  │  - Own schema definition                    │
+  │  - Own API logic (not shared with resource) │
+  │  - Standalone, no dependencies on SDK v2    │
+  └─────────────────────────────────────────────┘
+
+  PROS:
+  ✓ No dependency on SDK v2 code
+  ✓ Can implement now, doesn't need migration
+  ✓ Clean Plugin Framework implementation
+  ✓ Independent of resource/datasource changes
+
+  CONS:
+  ✗ API logic is duplicated (ephemeral has own copy)
+  ✗ Changes to API need updating in multiple places
+  ✗ More generated code
+```
+
+### What This Means
+
+| Approach | Status | Reason |
+|----------|--------|--------|
+| **Option A: Wrapper Pattern** | ❌ BLOCKED | Requires SDK v2 → PF migration |
+| **Option B: Ephemeral as Adapter** | ❌ BLOCKED | Same reason |
+| **Option C: Dual Generation (Standalone)** | ✅ VIABLE | No SDK v2 dependency |
+| **Option D: Plugin Framework Only** | ❌ BLOCKED | Requires full migration |
+| **Option E: Shared API Layer** | ❌ BLOCKED | Would need to refactor resources |
+
+**Recommended Path Forward:**
+1. Generate **standalone ephemeral resources** from YAML (Option C)
+2. Accept the code duplication for now
+3. Revisit unified generation after SDK v2 → Plugin Framework migration is complete
+
+---
+
 ## Current State: How It Works Today
 
 Before diving into the proposed unified approach, it's important to understand how data sources and ephemeral resources are currently implemented separately.
@@ -395,6 +523,659 @@ google/services/secretmanager/
 ├── ephemeral_secret_version.go                   # NEW: Plugin Framework ephemeral
 └── ephemeral_secret_version_test.go              # NEW: Ephemeral tests
 ```
+
+---
+
+### Critical Challenge: Type Conversion Between Frameworks
+
+You're right to call this out - this is one of the most important technical challenges. SDK v2 and Plugin Framework use completely different type systems.
+
+#### TL;DR - The Solution
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         THE SOLUTION IN ONE DIAGRAM                          │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+    SDK v2 Data Source                          Plugin Framework Ephemeral
+    ==================                          ==========================
+
+    schema.ResourceData                         model struct with types.String
+           │                                              │
+           │ d.Get("secret").(string)                     │ model.Secret.ValueString()
+           │                                              │
+           ▼                                              ▼
+    ┌─────────────────────────────────────────────────────────────────────────┐
+    │                                                                         │
+    │                    CoreData (Plain Go Types)                            │
+    │                                                                         │
+    │    type SecretVersionCoreData struct {                                  │
+    │        Project    string    // ← plain Go string, not SDK or PF type    │
+    │        Secret     string                                                │
+    │        SecretData string                                                │
+    │        Enabled    bool      // ← plain Go bool                          │
+    │    }                                                                    │
+    │                                                                         │
+    └─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+    ┌─────────────────────────────────────────────────────────────────────────┐
+    │                                                                         │
+    │              ReadSecretVersionCore(config, data) error                  │
+    │                                                                         │
+    │    // This function knows NOTHING about SDK v2 or Plugin Framework      │
+    │    // It only works with plain Go types                                 │
+    │    // Contains ALL the API logic (URL building, HTTP calls, parsing)    │
+    │                                                                         │
+    └─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+    ┌─────────────────────────────────────────────────────────────────────────┐
+    │                    CoreData (now populated)                             │
+    └─────────────────────────────────────────────────────────────────────────┘
+           │                                              │
+           │ d.Set("secret_data", data.SecretData)        │ model.SecretData = types.StringValue(data.SecretData)
+           │                                              │
+           ▼                                              ▼
+    schema.ResourceData                         model struct with types.String
+    (stored in state)                           (NOT stored - ephemeral!)
+```
+
+**In short:**
+1. **CoreData struct** uses plain Go types (`string`, `bool`, `int64`)
+2. **Core function** does all API work using only plain Go types
+3. **SDK v2 wrapper** converts `d.Get()` → CoreData → `d.Set()`
+4. **Plugin Framework wrapper** converts `model.X.ValueString()` → CoreData → `types.StringValue()`
+
+The frameworks never touch each other - they only talk to the plain Go CoreData struct.
+
+---
+
+#### Detailed Explanation
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    THE TYPE CONVERSION PROBLEM                               │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────┐     ┌─────────────────────────────────┐
+│   SDK v2 Types                  │     │   Plugin Framework Types        │
+│   (terraform-plugin-sdk)        │     │   (terraform-plugin-framework)  │
+├─────────────────────────────────┤     ├─────────────────────────────────┤
+│                                 │     │                                 │
+│  schema.TypeString  → string    │     │  types.String  → has methods:   │
+│  schema.TypeInt     → int       │     │    .ValueString()               │
+│  schema.TypeBool    → bool      │     │    .IsNull()                    │
+│  schema.TypeFloat   → float64   │     │    .IsUnknown()                 │
+│  schema.TypeList    → []any     │     │                                 │
+│  schema.TypeSet     → *Set      │     │  types.Int64   → has methods:   │
+│  schema.TypeMap     → map       │     │    .ValueInt64()                │
+│                                 │     │    .IsNull()                    │
+│  Access via:                    │     │                                 │
+│  d.Get("field").(string)        │     │  types.Bool    → has methods:   │
+│  d.Set("field", value)          │     │    .ValueBool()                 │
+│                                 │     │                                 │
+│  No null/unknown distinction    │     │  types.List, types.Set, etc.    │
+│  Empty string = not set         │     │                                 │
+│                                 │     │  Access via model struct:       │
+│                                 │     │  model.Field.ValueString()      │
+└─────────────────────────────────┘     └─────────────────────────────────┘
+                │                                       │
+                │         INCOMPATIBLE!                 │
+                └───────────────┬───────────────────────┘
+                                │
+                                ▼
+                    ┌───────────────────────┐
+                    │   How do we share     │
+                    │   code between them?  │
+                    └───────────────────────┘
+```
+
+---
+
+### The Solution: Plain Go Types as Bridge (CoreData Struct)
+
+The wrapper pattern solves this by using **plain Go types** (`string`, `bool`, `int64`, etc.) as an intermediate representation. Both frameworks convert to/from this common struct:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    THE COREDATA BRIDGE PATTERN                               │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────┐     ┌─────────────────────────────────┐
+│   SDK v2 Data Source            │     │   Plugin Framework Ephemeral    │
+│   (schema.ResourceData)         │     │   (typed model struct)          │
+└─────────────────────────────────┘     └─────────────────────────────────┘
+                │                                       │
+                │  CONVERT TO                           │  CONVERT TO
+                ▼                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                                                                             │
+│   CoreData Struct (Plain Go Types - Framework Agnostic)                     │
+│                                                                             │
+│   type SecretVersionCoreData struct {                                       │
+│       // Input fields - plain Go types                                      │
+│       Project string                                                        │
+│       Secret  string                                                        │
+│       Version string                                                        │
+│                                                                             │
+│       // Output fields - plain Go types                                     │
+│       Name        string                                                    │
+│       SecretData  string                                                    │
+│       CreateTime  string                                                    │
+│       DestroyTime string                                                    │
+│       Enabled     bool                                                      │
+│   }                                                                         │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                │
+                                │  PASSED TO
+                                ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                                                                             │
+│   Core Function (Framework Agnostic)                                        │
+│                                                                             │
+│   func ReadSecretVersionCore(                                               │
+│       config *transport_tpg.Config,                                         │
+│       userAgent string,                                                     │
+│       data *SecretVersionCoreData,    // ← Plain Go types                   │
+│       opts *SecretVersionCoreConfig,                                        │
+│   ) error {                                                                 │
+│       // All API logic here - no framework dependencies                     │
+│       // Works with plain strings, bools, etc.                              │
+│   }                                                                         │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                │
+                                │  RETURNS
+                                ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│   CoreData Struct (now populated with results)                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+                │                                       │
+                │  CONVERT FROM                         │  CONVERT FROM
+                ▼                                       ▼
+┌─────────────────────────────────┐     ┌─────────────────────────────────┐
+│   SDK v2 Data Source            │     │   Plugin Framework Ephemeral    │
+│   d.Set("field", value)         │     │   model.Field = types.StringVal │
+└─────────────────────────────────┘     └─────────────────────────────────┘
+```
+
+---
+
+### Type Conversion Code Examples
+
+**SDK v2 → CoreData (in data source):**
+
+```go
+func dataSourceSecretVersionRead(d *schema.ResourceData, meta interface{}) error {
+    config := meta.(*transport_tpg.Config)
+
+    // ┌─────────────────────────────────────────────────────────────────┐
+    // │ CONVERT: SDK v2 schema.ResourceData → Plain Go types (CoreData) │
+    // └─────────────────────────────────────────────────────────────────┘
+    coreData := &SecretVersionCoreData{
+        Project: d.Get("project").(string),      // SDK v2 type assertion
+        Secret:  d.Get("secret").(string),       // SDK v2 type assertion
+        Version: d.Get("version").(string),      // SDK v2 type assertion
+    }
+
+    // Call framework-agnostic core function
+    if err := ReadSecretVersionCore(config, userAgent, coreData, nil); err != nil {
+        return err
+    }
+
+    // ┌─────────────────────────────────────────────────────────────────┐
+    // │ CONVERT: Plain Go types (CoreData) → SDK v2 schema.ResourceData │
+    // └─────────────────────────────────────────────────────────────────┘
+    d.SetId(coreData.Name)
+    d.Set("name", coreData.Name)                 // string → SDK v2
+    d.Set("secret_data", coreData.SecretData)    // string → SDK v2
+    d.Set("enabled", coreData.Enabled)           // bool → SDK v2
+
+    return nil
+}
+```
+
+**Plugin Framework → CoreData (in ephemeral resource):**
+
+```go
+func (e *ephemeralSecretVersion) Open(ctx context.Context, req ephemeral.OpenRequest, resp *ephemeral.OpenResponse) {
+    var model ephemeralSecretVersionModel
+    resp.Diagnostics.Append(req.Config.Get(ctx, &model)...)
+
+    // ┌─────────────────────────────────────────────────────────────────┐
+    // │ CONVERT: Plugin Framework types.String → Plain Go string        │
+    // └─────────────────────────────────────────────────────────────────┘
+    coreData := &SecretVersionCoreData{
+        Project: model.Project.ValueString(),    // types.String → string
+        Secret:  model.Secret.ValueString(),     // types.String → string
+        Version: model.Version.ValueString(),    // types.String → string
+    }
+
+    // Call framework-agnostic core function
+    if err := ReadSecretVersionCore(config, userAgent, coreData, nil); err != nil {
+        resp.Diagnostics.AddError("Error", err.Error())
+        return
+    }
+
+    // ┌─────────────────────────────────────────────────────────────────┐
+    // │ CONVERT: Plain Go string → Plugin Framework types.String        │
+    // └─────────────────────────────────────────────────────────────────┘
+    model.Name = types.StringValue(coreData.Name)           // string → types.String
+    model.SecretData = types.StringValue(coreData.SecretData)
+    model.Enabled = types.BoolValue(coreData.Enabled)       // bool → types.Bool
+
+    // Handle null vs empty (Plugin Framework distinction)
+    if coreData.DestroyTime != "" {
+        model.DestroyTime = types.StringValue(coreData.DestroyTime)
+    } else {
+        model.DestroyTime = types.StringNull()  // Explicit null
+    }
+
+    resp.Diagnostics.Append(resp.Result.Set(ctx, model)...)
+}
+```
+
+---
+
+### Handling Complex Types
+
+The conversion is straightforward for primitives, but what about complex types like lists, maps, and nested objects?
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    COMPLEX TYPE CONVERSION STRATEGIES                        │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────┬─────────────────────────────────┬─────────┐
+│   Type                          │   CoreData Representation       │  Notes  │
+├─────────────────────────────────┼─────────────────────────────────┼─────────┤
+│   String                        │   string                        │  Simple │
+│   Integer                       │   int64                         │  Simple │
+│   Boolean                       │   bool                          │  Simple │
+│   Float                         │   float64                       │  Simple │
+├─────────────────────────────────┼─────────────────────────────────┼─────────┤
+│   List of Strings               │   []string                      │  Easy   │
+│   Set of Strings                │   []string (order ignored)      │  Easy   │
+│   Map of Strings                │   map[string]string             │  Easy   │
+├─────────────────────────────────┼─────────────────────────────────┼─────────┤
+│   List of Objects               │   []NestedCoreData              │  Medium │
+│   Nested Object                 │   *NestedCoreData               │  Medium │
+├─────────────────────────────────┼─────────────────────────────────┼─────────┤
+│   Deeply Nested / Complex       │   map[string]interface{}        │  Hard   │
+│                                 │   (use JSON marshaling)         │         │
+└─────────────────────────────────┴─────────────────────────────────┴─────────┘
+```
+
+**Example: List of Strings**
+
+```go
+// CoreData struct
+type SecretVersionCoreData struct {
+    Labels []string  // Plain Go slice
+}
+
+// SDK v2 → CoreData
+labels := d.Get("labels").([]interface{})
+coreData.Labels = make([]string, len(labels))
+for i, v := range labels {
+    coreData.Labels[i] = v.(string)
+}
+
+// Plugin Framework → CoreData
+var labelsList []string
+model.Labels.ElementsAs(ctx, &labelsList, false)
+coreData.Labels = labelsList
+
+// CoreData → SDK v2
+d.Set("labels", coreData.Labels)
+
+// CoreData → Plugin Framework
+labelValues := make([]attr.Value, len(coreData.Labels))
+for i, v := range coreData.Labels {
+    labelValues[i] = types.StringValue(v)
+}
+model.Labels, _ = types.ListValue(types.StringType, labelValues)
+```
+
+**Example: Nested Object**
+
+```go
+// CoreData structs
+type SecretVersionCoreData struct {
+    Replication *ReplicationCoreData
+}
+
+type ReplicationCoreData struct {
+    Automatic   bool
+    UserManaged *UserManagedCoreData
+}
+
+// The conversion follows the same pattern recursively
+```
+
+---
+
+### Why Plain Go Types Work
+
+| Consideration | Plain Go Types Solution |
+|--------------|------------------------|
+| **Null handling** | Use pointers (`*string`) or empty values + separate flag |
+| **Unknown handling** | Not applicable at read time (values are known) |
+| **Type safety** | Go compiler enforces types |
+| **Serialization** | Easy to JSON marshal for debugging |
+| **Testing** | Can unit test core function with plain Go values |
+| **Performance** | Minimal overhead - just value copying |
+
+---
+
+### Handling Null vs Empty (Plugin Framework Distinction)
+
+Plugin Framework distinguishes between null, unknown, and empty values. SDK v2 does not. Here's how to handle this:
+
+```go
+// In CoreData, use pointers for nullable fields
+type SecretVersionCoreData struct {
+    DestroyTime *string  // nil = null, "" = empty string, "value" = has value
+}
+
+// Or use a separate "is set" flag
+type SecretVersionCoreData struct {
+    DestroyTime      string
+    DestroyTimeIsSet bool
+}
+
+// Plugin Framework conversion
+if coreData.DestroyTime != nil {
+    model.DestroyTime = types.StringValue(*coreData.DestroyTime)
+} else {
+    model.DestroyTime = types.StringNull()
+}
+
+// SDK v2 conversion (doesn't distinguish null vs empty)
+if coreData.DestroyTime != nil {
+    d.Set("destroy_time", *coreData.DestroyTime)
+}
+```
+
+---
+
+### Potential Problems and Open Questions
+
+This approach has trade-offs and challenges that need to be addressed:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    POTENTIAL PROBLEMS WITH THIS APPROACH                     │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 1. Null vs Unknown vs Empty - The Hardest Problem
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│   Plugin Framework has THREE states:                                        │
+│                                                                             │
+│   types.StringNull()     → Field was not set (null in JSON)                 │
+│   types.StringUnknown()  → Field value not yet known (during plan)          │
+│   types.StringValue("")  → Field was explicitly set to empty string         │
+│                                                                             │
+│   SDK v2 only has TWO:                                                      │
+│                                                                             │
+│   "" (empty string)      → Could mean null OR empty, ambiguous!             │
+│   "value"                → Has a value                                      │
+│                                                                             │
+│   Plain Go has TWO (without pointers):                                      │
+│                                                                             │
+│   "" (zero value)        → Could mean null OR empty                         │
+│   "value"                → Has a value                                      │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+QUESTION: How do we preserve null vs empty distinction through CoreData?
+
+SOLUTION OPTIONS:
+  A) Use pointers: *string (nil = null, "" = empty, "val" = value)
+  B) Use wrapper: type NullableString struct { Value string; IsNull bool }
+  C) Ignore it: Most fields don't need this distinction for read-only ops
+  D) Per-field decision: Only use pointers for fields where it matters
+```
+
+#### 2. Unknown Values During Planning
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│   PROBLEM: Plugin Framework can have "unknown" values during terraform plan │
+│                                                                             │
+│   ephemeral "google_secret" "x" {                                           │
+│       secret = google_secret.new_secret.name  # Unknown until apply!        │
+│   }                                                                         │
+│                                                                             │
+│   During plan:                                                              │
+│     model.Secret.IsUnknown() == true                                        │
+│     model.Secret.ValueString() == ""  # Returns empty, not the real value! │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+QUESTION: What happens if we call the core function with unknown values?
+
+ANSWER: For ephemeral resources, Open() is only called during apply, not plan.
+        So unknown values should be resolved by the time Open() runs.
+        But we should still check and handle gracefully:
+
+        if model.Secret.IsUnknown() {
+            resp.Diagnostics.AddError("Cannot read", "Secret is not yet known")
+            return
+        }
+```
+
+#### 3. Complex Nested Types Get Messy
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│   PROBLEM: Deeply nested structures require lots of conversion code         │
+│                                                                             │
+│   Example: A resource with nested blocks                                    │
+│                                                                             │
+│   properties:                                                               │
+│     - name: 'replication'                                                   │
+│       type: NestedObject                                                    │
+│       properties:                                                           │
+│         - name: 'replicas'                                                  │
+│           type: Array                                                       │
+│           item_type:                                                        │
+│             type: NestedObject                                              │
+│             properties:                                                     │
+│               - name: 'location'                                            │
+│                 type: String                                                │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+QUESTION: Do we generate conversion code for every nested level?
+
+SOLUTION OPTIONS:
+  A) Generate recursive CoreData structs and conversion functions
+  B) Use map[string]interface{} for complex nested data (lose type safety)
+  C) Limit ephemeral generation to "simple" resources only
+  D) Use JSON marshal/unmarshal as intermediate (performance cost)
+```
+
+#### 4. Validation Logic Duplication
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│   PROBLEM: Validators are framework-specific                                │
+│                                                                             │
+│   SDK v2:                                                                   │
+│     ValidateFunc: validation.StringInSlice([]string{"A", "B"}, false)       │
+│                                                                             │
+│   Plugin Framework:                                                         │
+│     Validators: []validator.String{stringvalidator.OneOf("A", "B")}         │
+│                                                                             │
+│   These can't be shared!                                                    │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+QUESTION: Do we duplicate validation in both places?
+
+SOLUTION OPTIONS:
+  A) Generate framework-specific validators from YAML validation rules
+  B) Do validation in core function (after type conversion) - adds latency
+  C) Accept duplication - validation code is usually small
+  D) Only validate in core, skip framework validators
+```
+
+#### 5. Error Handling Differences
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│   PROBLEM: Different error patterns                                         │
+│                                                                             │
+│   SDK v2:          return fmt.Errorf("failed: %s", err)                     │
+│   Plugin Framework: resp.Diagnostics.AddError("Title", "Detail")            │
+│   Core function:    return error (plain Go)                                 │
+│                                                                             │
+│   Core returns error, wrappers must convert to their format                 │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+QUESTION: How do we provide good error messages from core?
+
+SOLUTION: Core returns structured errors that wrappers can format:
+
+  type CoreError struct {
+      Operation string  // "reading secret version"
+      Detail    string  // "API returned 404"
+      Err       error   // underlying error
+  }
+
+  // SDK v2 wrapper
+  if err != nil {
+      return fmt.Errorf("Error %s: %s", err.Operation, err.Detail)
+  }
+
+  // Plugin Framework wrapper
+  if err != nil {
+      resp.Diagnostics.AddError(
+          fmt.Sprintf("Error %s", err.Operation),
+          err.Detail,
+      )
+  }
+```
+
+#### 6. Custom Code Injection
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│   PROBLEM: Some resources need custom logic that can't be generated         │
+│                                                                             │
+│   Example: Special API call patterns, custom encoding, workarounds          │
+│                                                                             │
+│   Current resources have:                                                   │
+│     custom_code:                                                            │
+│       encoder: 'templates/terraform/encoders/my_resource.go.tmpl'           │
+│       pre_read: 'templates/terraform/pre_read/my_resource.go.tmpl'          │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+QUESTION: How do we allow custom code in the core function?
+
+SOLUTION OPTIONS:
+  A) Custom code templates that inject into core function
+  B) Pre/post hooks: PreReadCore(), PostReadCore()
+  C) Override entire core function with custom template
+  D) Limit ephemeral generation to resources without custom code
+```
+
+#### 7. Performance Overhead
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│   PROBLEM: Extra conversion steps add overhead                              │
+│                                                                             │
+│   Before (direct):                                                          │
+│     API Response → SDK v2 types                                             │
+│                                                                             │
+│   After (with core):                                                        │
+│     API Response → CoreData → SDK v2 types                                  │
+│     API Response → CoreData → Plugin Framework types                        │
+│                                                                             │
+│   Extra allocations and copies                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+QUESTION: Is the performance hit acceptable?
+
+ANSWER: Probably yes, because:
+  - Read operations are I/O bound (API calls), not CPU bound
+  - CoreData structs are small
+  - Only adds microseconds, API calls take milliseconds
+  - Trade-off is worth it for code maintainability
+```
+
+#### 8. Testing Complexity
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│   PROBLEM: More moving parts = more things to test                          │
+│                                                                             │
+│   Need to test:                                                             │
+│     1. Core function (unit tests with plain Go)                             │
+│     2. SDK v2 → CoreData conversion                                         │
+│     3. CoreData → SDK v2 conversion                                         │
+│     4. Plugin Framework → CoreData conversion                               │
+│     5. CoreData → Plugin Framework conversion                               │
+│     6. End-to-end acceptance tests                                          │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+QUESTION: How do we test all these layers?
+
+SOLUTION:
+  - Core function: Unit tests with mock HTTP responses
+  - Conversion: Generate test helpers alongside conversion code
+  - E2E: Existing acceptance test patterns still work
+  - Benefit: Core function is easier to unit test than framework-specific code
+```
+
+#### 9. What About Data Sources That Already Exist?
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│   PROBLEM: Many data sources are handwritten, not generated                 │
+│                                                                             │
+│   Examples:                                                                 │
+│     data_source_secret_manager_secret_version.go  (handwritten)             │
+│     data_source_google_client_config.go           (handwritten)             │
+│     data_source_compute_instance.go               (handwritten)             │
+│                                                                             │
+│   These don't use the datasource.go.tmpl template                           │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+QUESTION: How do we add ephemeral resources for handwritten data sources?
+
+SOLUTION OPTIONS:
+  A) Refactor handwritten data sources to use core pattern (breaking change)
+  B) Write ephemeral resources by hand (defeats the purpose)
+  C) Extract core from existing handwritten code into separate file
+  D) Only support ephemeral generation for YAML-defined resources
+```
+
+---
+
+### Summary: Is This Approach Worth It?
+
+| Challenge | Severity | Mitigation |
+|-----------|----------|------------|
+| Null vs Empty distinction | Medium | Use pointers for nullable fields |
+| Unknown values | Low | Only affects plan-time, ephemeral is apply-time |
+| Nested types | High | Start with simple resources, add complexity later |
+| Validation duplication | Low | Generate from YAML, small code anyway |
+| Error handling | Low | Use structured errors in core |
+| Custom code | Medium | Support injection points in templates |
+| Performance | Low | Negligible compared to API latency |
+| Testing | Medium | Core is actually easier to unit test |
+| Handwritten data sources | High | Case-by-case migration |
+
+**Verdict:** The approach is sound, but start with simple resources and iterate:
+
+1. **Phase 1:** Generate for simple resources (few fields, no nesting)
+2. **Phase 2:** Add support for lists and maps
+3. **Phase 3:** Add support for nested objects
+4. **Phase 4:** Migration path for handwritten data sources
 
 ---
 
